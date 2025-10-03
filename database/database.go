@@ -17,6 +17,14 @@ type ActiveTimerInfo struct {
 	StartTime   time.Time
 }
 
+type TimeEntry struct {
+	ProjectName string
+	StartTime   time.Time
+	EndTime     time.Time
+	Duration    time.Duration
+	Notes       string
+}
+
 var DB *sql.DB
 
 func InitDatabase() {
@@ -159,9 +167,56 @@ func StopTimer(note string) (*string, error) {
 	}
 
 	_, err = DB.Exec("UPDATE time_entries SET end_time = ?, notes = ? WHERE id = ?", time.Now(), note, activeTimerID)
+	return &projectName, nil
+}
+
+func GetActiveTimerInfo() (*ActiveTimerInfo, error) {
+	var info ActiveTimerInfo
+	err := DB.QueryRow(`
+		SELECT p.name, te.start_time FROM time_entries te
+		JOIN projects p ON te.project_id = p.id
+		WHERE te.end_time IS NULL
+	`).Scan(&info.ProjectName, &info.StartTime)
+
 	if err != nil {
+		if err == sql.ErrNoRows {
+			// No active timer
+			return nil, nil
+		}
 		return nil, err
 	}
 
-	return &projectName, nil
+	return &info, nil
 }
+
+func GetTimeEntries(start time.Time, end time.Time) ([]TimeEntry, error) {
+	rows, err := DB.Query(`
+		SELECT p.name, te.start_time, te.end_time, te.notes
+		FROM time_entries te
+		JOIN projects p ON te.project_id = p.id
+		WHERE te.end_time IS NOT NULL AND te.start_time >= ? AND te.end_time <= ?
+		ORDER BY te.start_time DESC
+	`, start, end)
+
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var entries []TimeEntry
+	for rows.Next() {
+		var entry TimeEntry
+		var notes sql.NullString
+		if err := rows.Scan(&entry.ProjectName, &entry.StartTime, &entry.EndTime, &notes); err != nil {
+			return nil, err
+		}
+		entry.Duration = entry.EndTime.Sub(entry.StartTime)
+		if notes.Valid {
+			entry.Notes = notes.String
+		}
+		entries = append(entries, entry)
+	}
+
+	return entries, nil
+}
+
