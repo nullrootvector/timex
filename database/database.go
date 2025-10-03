@@ -1,9 +1,9 @@
-
 package database
 
 import (
 	"database/sql"
 	"errors"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -26,6 +26,12 @@ type TimeEntry struct {
 }
 
 var DB *sql.DB
+
+// querier can be a *sql.DB or a *sql.Tx
+type querier interface {
+	Exec(query string, args ...interface{}) (sql.Result, error)
+	QueryRow(query string, args ...interface{}) *sql.Row
+}
 
 func InitDatabase() {
 	home, err := os.UserHomeDir()
@@ -91,21 +97,30 @@ func GetProjects() ([]string, error) {
 }
 
 func AddProject(name string) error {
-	_, err := DB.Exec("INSERT INTO projects (name) VALUES (?)", name)
+	return addProject(DB, name)
+}
+
+func addProject(q querier, name string) error {
+	_, err := q.Exec("INSERT INTO projects (name) VALUES (?)", name)
 	return err
 }
 
+
 func getProjectID(name string) (int, error) {
+	return getProjectIDTx(DB, name)
+}
+
+func getProjectIDTx(q querier, name string) (int, error) {
 	var id int
-	err := DB.QueryRow("SELECT id FROM projects WHERE name = ?", name).Scan(&id)
+	err := q.QueryRow("SELECT id FROM projects WHERE name = ?", name).Scan(&id)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// Project doesn't exist, create it
-			if err := AddProject(name); err != nil {
+			if err := addProject(q, name); err != nil {
 				return 0, err
 			}
 			// Get the ID of the newly created project
-			return getProjectID(name)
+			return getProjectIDTx(q, name)
 		}
 		return 0, err
 	}
@@ -220,3 +235,98 @@ func GetTimeEntries(start time.Time, end time.Time) ([]TimeEntry, error) {
 	return entries, nil
 }
 
+func SwitchTimer(newProjectName string) (*string, error) {
+	tx, err := DB.Begin()
+	if err != nil {
+		return nil, err
+	}
+
+	// 1. Stop the current timer
+	var activeTimerID int
+	var oldProjectName string
+	err = tx.QueryRow(`
+		SELECT te.id, p.name FROM time_entries te
+		JOIN projects p ON te.project_id = p.id
+		WHERE te.end_time IS NULL
+	`).Scan(&activeTimerID, &oldProjectName)
+
+	if err != nil {
+		if err == sql.ErrNoRows {
+			tx.Rollback()
+			return nil, errors.New("no timer is currently running")
+		}
+		tx.Rollback()
+		return nil, err
+	}
+
+	_, err = tx.Exec("UPDATE time_entries SET end_time = ? WHERE id = ?", time.Now(), activeTimerID)
+	if err != nil {
+		tx.Rollback()
+		return nil, err
+	}
+
+	// 2. Start a new timer
+	newProjectID, err := getProjectIDTx(tx, newProjectName)
+	if err != nil {
+		tx.Rollback()
+		return nil, err
+	}
+
+	_, err = tx.Exec("INSERT INTO time_entries (project_id, start_time) VALUES (?, ?)", newProjectID, time.Now())
+	if err != nil {
+		tx.Rollback()
+		return nil, err
+	}
+
+	return &oldProjectName, tx.Commit()
+}
+
+func RemoveProject(projectName string) error {
+	tx, err := DB.Begin()
+	if err != nil {
+		return err
+	}
+
+	// Get project ID
+	var projectID int
+	err = tx.QueryRow("SELECT id FROM projects WHERE name = ?", projectName).Scan(&projectID)
+	if err != nil {
+		tx.Rollback()
+		if err == sql.ErrNoRows {
+			return errors.New("project not found")
+		}
+		return err
+	}
+
+	// Check for time entries
+	var count int
+	err = tx.QueryRow("SELECT COUNT(*) FROM time_entries WHERE project_id = ?", projectID).Scan(&count)
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
+
+	if count > 0 {
+		tx.Rollback()
+		return fmt.Errorf("cannot remove project with %d associated time entries", count)
+	}
+
+	// Delete the project
+	_, err = tx.Exec("DELETE FROM projects WHERE id = ?", projectID)
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
+
+	return tx.Commit()
+}
+
+func LogTime(projectName string, startTime time.Time, endTime time.Time) error {
+	projectID, err := getProjectID(projectName)
+	if err != nil {
+		return err
+	}
+
+	_, err = DB.Exec("INSERT INTO time_entries (project_id, start_time, end_time) VALUES (?, ?, ?)", projectID, startTime, endTime)
+	return err
+}
